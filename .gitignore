@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.bedrock_agentcore/
+*.log
+slice_*.png
+mem.txt
+.DS_Store
+fetch_aws.py
+setup_aws.py
+update_lambda.py
+build/
+*.egg-info/
