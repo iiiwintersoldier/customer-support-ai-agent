@@ -55,7 +55,7 @@ class SigV4Auth(httpx.Auth):
         yield request
 
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CSAI_Agent")
 
 # App Initialization
@@ -259,8 +259,12 @@ def search_knowledge_base(query: str) -> str:
     Returns:
         Relevant information retrieved from the knowledge base
     """
-    if not KB_ID or KB_ID == "<kbid>":
-        return "Knowledge base not configured."
+    # Validate KB configuration before calling AWS.
+    if not KB_ID or not KB_ID.strip() or KB_ID == "<kbid>":
+        return (
+            "Knowledge Base is not configured: KB_ID is empty or missing. "
+            "Please configure KB_ID before attempting a knowledge-base search."
+        )
 
     try:
         resp = _bedrock_runtime.retrieve(
@@ -374,39 +378,64 @@ async def invoke(payload, context=None):
         )
 
         agent_core_browser = AgentCoreBrowser(region=REGION)
-        tools_list = [search_knowledge_base, calculate_loyalty_discount, agent_core_browser.browser]
+        tools = [search_knowledge_base, calculate_loyalty_discount, agent_core_browser.browser]
 
         session = boto3.Session(region_name=REGION)
         creds = session.get_credentials().get_frozen_credentials()
         auth = SigV4Auth(creds, REGION, "bedrock-agentcore")
 
-        async with httpx.AsyncClient(auth=auth) as http_client:
-            mcp_client = MCPClient(lambda: streamable_http_client(GATEWAY_URL, http_client=http_client))
-            gateway_tools = await mcp_client.load_tools()
-            tools_list.extend(gateway_tools)
+        gateway_client = MCPClient(
+            lambda: streamable_http_client(GATEWAY_URL, http_client=httpx.AsyncClient(auth=auth))
+        )
 
-            agent = Agent(
-                model=model,
-                tools=tools_list,
-                system_prompt="You are a helpful customer support agent for an e-commerce platform.",
+        try:
+            with gateway_client:
+                try:
+                    gateway_tools = gateway_client.list_tools_sync()
+                    tools.extend(gateway_tools)
+                    logger.info(
+                        "Gateway connected successfully. Loaded %d tools.",
+                        len(gateway_tools),
+                    )
+                except TimeoutError:
+                    logger.exception("Gateway tool loading timed out")
+                except ConnectionError:
+                    logger.exception("Gateway connection failed")
+                except Exception as exc:
+                    logger.exception(
+                        "Gateway tool loading failed: %s", exc
+                    )
+        except TimeoutError:
+            logger.exception("Gateway tool loading timed out")
+        except ConnectionError:
+            logger.exception("Gateway connection failed")
+        except Exception as exc:
+            logger.exception(
+                "Gateway tool loading failed: %s", exc
             )
-            memory_hook.register_hooks(agent.hooks)
 
-            response = await agent.invoke_async(user_input)
+        agent = Agent(
+            model=model,
+            tools=tools,
+            system_prompt="You are a helpful customer support agent for an e-commerce platform.",
+        )
+        memory_hook.register_hooks(agent.hooks)
 
-            if hasattr(response, "content"):
-                if isinstance(response.content, str):
-                    return response.content
-                elif isinstance(response.content, list):
-                    for block in response.content:
-                        if isinstance(block, dict):
-                            if "text" in block:
-                                return block["text"]
-                            elif block.get("type") == "text":
-                                return block.get("text", "")
-                        elif hasattr(block, "text"):
-                            return getattr(block, "text", "")
-            return str(response)
+        response = await agent.invoke_async(user_input)
+
+        if hasattr(response, "content"):
+            if isinstance(response.content, str):
+                return response.content
+            elif isinstance(response.content, list):
+                for block in response.content:
+                    if isinstance(block, dict):
+                        if "text" in block:
+                            return block["text"]
+                        elif block.get("type") == "text":
+                            return block.get("text", "")
+                    elif hasattr(block, "text"):
+                        return getattr(block, "text", "")
+        return str(response)
 
     except Exception as e:
         import traceback
